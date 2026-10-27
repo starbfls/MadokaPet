@@ -1,0 +1,48 @@
+{
+  "characters": [
+    {
+      "id": "madoka",
+      "name": "樋口円香",
+      "shortName": "円香",
+      "costume": "和风服装",
+      "image": "madoka.png",
+      "dialogues": "dialogues.json",
+      "theme": {
+        "ink": "#392D38",
+        "muted": "#89747E",
+        "accent": "#8F2E4E",
+        "accentSoft": "#F7EAF0",
+        "surface": "#FFFAF7",
+        "border": "#DAC2C8",
+        "bubble": "#FFF9F7",
+        "bubbleBorder": "#DFC1CB",
+        "speech": "#F5E8EB",
+        "card": "#F5EEEA",
+        "track": "#E6D7DA",
+        "preview": "#EEE8ED"
+      }
+    },
+    {
+      "id": "rinze",
+      "name": "杜野凛世",
+      "shortName": "凛世",
+      "costume": "Snow Magic 冬装",
+      "image": "rinze.png",
+      "dialogues": "dialogues.rinze.json",
+      "theme": {
+        "ink": "#293D55",
+        "muted": "#60788E",
+        "accent": "#326B93",
+        "accentSoft": "#E2F0FB",
+        "surface": "#F8FCFF",
+        "border": "#B9D6EB",
+        "bubble": "#F6FBFF",
+        "bubbleBorder": "#B1D2EA",
+        "speech": "#E5F2FC",
+        "card": "#EDF5FC",
+        "track": "#CCE1F0",
+        "preview": "#E8F1F8"
+      }
+    }
+  ]
+}

@@ -13,6 +13,7 @@ using System.Web.Script.Serialization;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Markup;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Media.Imaging;
@@ -180,7 +181,7 @@ namespace MadokaDesktop
                     process.BeginErrorReadLine();
                     var deadline = DateTime.UtcNow.AddSeconds(25);
                     await Send(process, new { id = 1, method = "initialize", @params = new {
-                        clientInfo = new { name = "madoka_desktop_pet", title = "Madoka Desktop Pet", version = "1.0.0" } } }).ConfigureAwait(false);
+                    clientInfo = new { name = "madoka_desktop_pet", title = "Madoka Desktop Pet", version = "1.1.0" } } }).ConfigureAwait(false);
                     await Response(process, 1, deadline).ConfigureAwait(false);
                     await Send(process, new { method = "initialized", @params = new { } }).ConfigureAwait(false);
                     await Send(process, new { id = 2, method = "account/rateLimits/read" }).ConfigureAwait(false);
@@ -228,14 +229,85 @@ namespace MadokaDesktop
         }
     }
 
+    sealed class PetTheme
+    {
+        readonly Dictionary<string, Brush> colors = new Dictionary<string, Brush>();
+        public PetTheme(object values)
+        {
+            foreach (var key in new[] { "ink", "muted", "accent", "accentSoft", "surface", "border", "bubble", "bubbleBorder", "speech", "card", "track", "preview" })
+            {
+                var color = Json.Str(Json.Get(values, key));
+                if (color.Length == 0) throw new InvalidDataException("Missing theme color: " + key);
+                var brush = (SolidColorBrush)new BrushConverter().ConvertFromString(color); brush.Freeze(); colors.Add(key, brush);
+            }
+        }
+        public Brush this[string key] { get { return colors[key]; } }
+    }
+
+    sealed class PetCharacter
+    {
+        public string Id;
+        public string Name;
+        public string ShortName;
+        public string Costume;
+        public string ImageResource;
+        public string DialogueResource;
+        public PetTheme Theme;
+        public string Label { get { return Name + " · " + Costume; } }
+        BitmapSource image;
+        public BitmapSource Image
+        {
+            get
+            {
+                if (image == null)
+                {
+                    using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(ImageResource))
+                    {
+                        var source = new BitmapImage(); source.BeginInit(); source.CacheOption = BitmapCacheOption.OnLoad;
+                        source.StreamSource = stream; source.EndInit(); source.Freeze();
+                        // Fit the visible figure rather than the generator's differing canvas margins.
+                        // This changes display bounds only; the generated PNG remains untouched.
+                        var rgba = new FormatConvertedBitmap(source, PixelFormats.Bgra32, null, 0);
+                        var pixels = new byte[rgba.PixelWidth * rgba.PixelHeight * 4]; rgba.CopyPixels(pixels, rgba.PixelWidth * 4, 0);
+                        int left = rgba.PixelWidth, top = rgba.PixelHeight, right = -1, bottom = -1;
+                        for (int y = 0; y < rgba.PixelHeight; y++) for (int x = 0; x < rgba.PixelWidth; x++)
+                            if (pixels[(y * rgba.PixelWidth + x) * 4 + 3] >= 24)
+                            { left = Math.Min(left, x); top = Math.Min(top, y); right = Math.Max(right, x); bottom = Math.Max(bottom, y); }
+                        if (right < left) throw new InvalidDataException("Empty portrait: " + ImageResource);
+                        left = Math.Max(0, left - 12); top = Math.Max(0, top - 12);
+                        right = Math.Min(rgba.PixelWidth - 1, right + 12); bottom = Math.Min(rgba.PixelHeight - 1, bottom + 12);
+                        image = new CroppedBitmap(source, new Int32Rect(left, top, right - left + 1, bottom - top + 1)); image.Freeze();
+                    }
+                }
+                return image;
+            }
+        }
+    }
+
+    static class CharacterCatalog
+    {
+        public static readonly PetCharacter[] All = Load();
+        static PetCharacter[] Load()
+        {
+            using (var reader = new StreamReader(Assembly.GetExecutingAssembly().GetManifestResourceStream("characters.json"), Encoding.UTF8))
+            {
+                return ((IEnumerable)Json.Get(Json.Read(reader.ReadToEnd()), "characters")).Cast<object>().Select(raw => new PetCharacter {
+                    Id = Json.Str(Json.Get(raw, "id")), Name = Json.Str(Json.Get(raw, "name")), ShortName = Json.Str(Json.Get(raw, "shortName")),
+                    Costume = Json.Str(Json.Get(raw, "costume")), ImageResource = Json.Str(Json.Get(raw, "image")),
+                    DialogueResource = Json.Str(Json.Get(raw, "dialogues")), Theme = new PetTheme(Json.Get(raw, "theme")) }).ToArray();
+            }
+        }
+        public static PetCharacter Get(string id) { return All.FirstOrDefault(p => p.Id == id) ?? All.First(p => p.Id == "madoka"); }
+    }
+
     sealed class DialogueBook
     {
         readonly Dictionary<string, object> data;
         readonly Random random = new Random();
         string last = "";
-        public DialogueBook()
+        public DialogueBook(string resource = "dialogues.json")
         {
-            using (var reader = new StreamReader(Assembly.GetExecutingAssembly().GetManifestResourceStream("dialogues.json"), Encoding.UTF8))
+            using (var reader = new StreamReader(Assembly.GetExecutingAssembly().GetManifestResourceStream(resource), Encoding.UTF8))
                 data = Json.Map(Json.Read(reader.ReadToEnd()));
         }
         public string Next(string category)
@@ -252,38 +324,47 @@ namespace MadokaDesktop
 
     sealed class PetState
     {
+        public string CharacterId = "madoka";
         public double Left = double.NaN;
         public double Top = double.NaN;
         public double Scale = 1;
         public bool Paused;
         public bool Topmost = true;
-        static string StatePath { get { return Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "state.json"); } }
-        public static PetState Load()
+        readonly string statePath;
+        public PetState(string path = null) { statePath = path ?? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "state.json"); }
+        public static PetState Parse(object data, string path = null)
         {
-            var state = new PetState();
+            var state = new PetState(path);
+            state.CharacterId = CharacterCatalog.Get(Json.Str(Json.Get(data, "characterId"))).Id;
+            state.Left = Json.Number(Json.Get(data, "left")) ?? double.NaN;
+            state.Top = Json.Number(Json.Get(data, "top")) ?? double.NaN;
+            state.Scale = Math.Max(.7, Math.Min(1.5, Json.Number(Json.Get(data, "scale")) ?? 1));
+            state.Paused = object.Equals(Json.Get(data, "paused"), true);
+            state.Topmost = !object.Equals(Json.Get(data, "topmost"), false);
+            return state;
+        }
+        public static PetState Load(string path = null)
+        {
+            var state = new PetState(path);
             try
             {
-                var data = Json.Read(File.ReadAllText(StatePath, Encoding.UTF8));
-                state.Left = Json.Number(Json.Get(data, "left")) ?? double.NaN;
-                state.Top = Json.Number(Json.Get(data, "top")) ?? double.NaN;
-                state.Scale = Math.Max(.7, Math.Min(1.5, Json.Number(Json.Get(data, "scale")) ?? 1));
-                state.Paused = object.Equals(Json.Get(data, "paused"), true);
-                state.Topmost = !object.Equals(Json.Get(data, "topmost"), false);
+                return Parse(Json.Read(File.ReadAllText(state.statePath, Encoding.UTF8)), path);
             }
             catch { }
             return state;
         }
         public void Save()
         {
-            try { File.WriteAllText(StatePath, Json.Codec.Serialize(new { left = Left, top = Top, scale = Scale, paused = Paused, topmost = Topmost }), new UTF8Encoding(false)); } catch { }
+            try { File.WriteAllText(statePath, Json.Codec.Serialize(new { characterId = CharacterId, left = Left, top = Top, scale = Scale, paused = Paused, topmost = Topmost }), new UTF8Encoding(false)); } catch { }
         }
     }
 
     sealed class PetWindow : Window
     {
-        readonly DialogueBook dialogues = new DialogueBook();
+        DialogueBook dialogues;
+        PetCharacter character;
         readonly UsageClient client = new UsageClient();
-        readonly PetState state = PetState.Load();
+        readonly PetState state;
         readonly DispatcherTimer talkTimer = new DispatcherTimer();
         readonly DispatcherTimer hideTimer = new DispatcherTimer();
         readonly DispatcherTimer refreshTimer = new DispatcherTimer();
@@ -298,6 +379,8 @@ namespace MadokaDesktop
         TextBlock panelStatus;
         TextBlock panelLine;
         Button refreshButton;
+        readonly Dictionary<string, Button> characterButtons = new Dictionary<string, Button>();
+        bool trayReady;
         UsageSnapshot snapshot;
         string fetchError;
         bool fetching;
@@ -305,9 +388,10 @@ namespace MadokaDesktop
         bool dragged;
         bool preview;
         Point press;
-        public static readonly Brush Ink = Brush("#392D38");
-        public static readonly Brush Muted = Brush("#89747E");
-        public static readonly Brush Wine = Brush("#8F2E4E");
+        PetTheme Theme { get { return character.Theme; } }
+        Brush Ink { get { return Theme["ink"]; } }
+        Brush Muted { get { return Theme["muted"]; } }
+        Brush Accent { get { return Theme["accent"]; } }
         public static Brush Brush(string hex) { var b = (SolidColorBrush)new BrushConverter().ConvertFromString(hex); b.Freeze(); return b; }
         static TextBlock Text(string text, double size, Brush color)
         {
@@ -316,7 +400,11 @@ namespace MadokaDesktop
         public PetWindow(bool forPreview = false, string smokeDirectory = null)
         {
             preview = forPreview;
-            Title = "樋口円香 · 桌宠";
+            state = PetState.Load(forPreview ? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "qa", "preview-state.json") :
+                (smokeDirectory == null ? null : Path.Combine(smokeDirectory, "smoke-state.json")));
+            character = CharacterCatalog.Get(state.CharacterId);
+            dialogues = new DialogueBook(character.DialogueResource);
+            Title = character.Name + " · 桌宠";
             Width = 290; Height = 370;
             AllowsTransparency = true; WindowStyle = WindowStyle.None; Background = Brushes.Transparent;
             ResizeMode = ResizeMode.NoResize; ShowInTaskbar = false; Topmost = state.Topmost;
@@ -327,17 +415,12 @@ namespace MadokaDesktop
             figure.VerticalAlignment = VerticalAlignment.Bottom; figure.HorizontalAlignment = HorizontalAlignment.Center;
             figure.Margin = new Thickness(0, 0, 0, 9);
             figure.Stretch = Stretch.Uniform;
-            var bitmap = new BitmapImage();
-            using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("madoka.png"))
-            {
-                bitmap.BeginInit(); bitmap.CacheOption = BitmapCacheOption.OnLoad; bitmap.StreamSource = stream; bitmap.EndInit(); bitmap.Freeze();
-            }
-            figure.Source = bitmap; Icon = bitmap;
+            figure.Source = character.Image; Icon = character.Image;
             figure.ToolTip = "单击查看额度 · 拖动换位置 · 右键打开菜单";
             figure.Cursor = Cursors.Hand; figure.RenderTransform = breathing;
             RenderOptions.SetBitmapScalingMode(figure, BitmapScalingMode.HighQuality);
             stage.Children.Add(figure);
-            bubble.Background = Brush("#FFF9F7"); bubble.BorderBrush = Brush("#DFC1CB"); bubble.BorderThickness = new Thickness(1);
+            bubble.Background = Theme["bubble"]; bubble.BorderBrush = Theme["bubbleBorder"]; bubble.BorderThickness = new Thickness(1);
             bubble.CornerRadius = new CornerRadius(17, 17, 4, 17); bubble.Padding = new Thickness(16, 12, 16, 12);
             bubble.HorizontalAlignment = HorizontalAlignment.Center; bubble.VerticalAlignment = VerticalAlignment.Top;
             bubble.Width = 258; bubble.Margin = new Thickness(0, 5, 0, 0); bubble.Visibility = Visibility.Hidden;
@@ -383,6 +466,29 @@ namespace MadokaDesktop
                 if (panel != null) panel.Close(); tray.Visible = false; tray.Dispose();
             };
         }
+        void SwitchCharacter(string id)
+        {
+            var next = CharacterCatalog.Get(id);
+            if (next.Id == character.Id) return;
+            // Load every resource first so a failed load cannot leave a mixed character/theme.
+            var nextImage = next.Image;
+            var nextDialogue = new DialogueBook(next.DialogueResource);
+            character = next; dialogues = nextDialogue; state.CharacterId = next.Id;
+            figure.Source = nextImage; Icon = nextImage; Title = next.Name + " · 桌宠";
+            hideTimer.Stop(); bubble.Visibility = Visibility.Hidden; bubbleText.Text = "";
+            bubble.Background = Theme["bubble"]; bubble.BorderBrush = Theme["bubbleBorder"]; bubbleText.Foreground = Ink;
+            ContextMenu = BuildMenu();
+            if (trayReady) SetupTray();
+            if (panel != null)
+            {
+                BuildPanelContent();
+                panelLine.Text = dialogues.Next("startup"); RenderUsage();
+                panel.UpdateLayout(); PositionPanel();
+            }
+            // A switch keeps the usage request, snapshot, location and other preferences intact.
+            talkTimer.Interval = TimeSpan.FromSeconds(dialogues.NextDelay());
+            if (!preview) { SaveState(); if (panel == null || !panel.IsVisible) Say("startup"); }
+        }
         void StartBreathing()
         {
             if (!SystemParameters.ClientAreaAnimation) return;
@@ -408,8 +514,16 @@ namespace MadokaDesktop
         }
         ContextMenu BuildMenu()
         {
-            var menu = new ContextMenu { FontFamily = FontFamily };
+            var menu = new ContextMenu { FontFamily = FontFamily, Background = Theme["surface"], Foreground = Ink, BorderBrush = Theme["border"] };
             Action<string, Action> add = (label, action) => { var item = new MenuItem { Header = label }; item.Click += delegate { action(); }; menu.Items.Add(item); };
+            var characters = new MenuItem { Header = "切换角色" };
+            foreach (var profile in CharacterCatalog.All)
+            {
+                var selected = profile;
+                var option = new MenuItem { Header = profile.Label, IsCheckable = true, IsChecked = profile.Id == character.Id };
+                option.Click += delegate { SwitchCharacter(selected.Id); }; characters.Items.Add(option);
+            }
+            menu.Items.Add(characters); menu.Items.Add(new Separator());
             add("查看用量", delegate { OpenPanel(); });
             add("换一句台词", delegate { Say(AmbientCategory()); });
             var pause = new MenuItem { Header = "暂停随机台词", IsCheckable = true, IsChecked = state.Paused };
@@ -424,22 +538,34 @@ namespace MadokaDesktop
                 option.Click += delegate { SetScale(current); ClampToScreen(); SaveState(); }; sizes.Items.Add(option);
             }
             menu.Items.Add(sizes); add("移回屏幕右下角", delegate { DefaultPosition(); SaveState(); });
-            menu.Items.Add(new Separator()); add("退出円香", delegate { Close(); });
+            menu.Items.Add(new Separator()); add("退出" + character.ShortName, delegate { Close(); });
             menu.Opened += delegate { pause.IsChecked = state.Paused; pinned.IsChecked = Topmost; };
             return menu;
         }
         void SetupTray()
         {
             tray.Icon = System.Drawing.SystemIcons.Application;
-            tray.Text = "樋口円香 · 单击人物查看 Codex 额度";
-            var menu = new Forms.ContextMenuStrip();
-            menu.Items.Add("显示円香", null, delegate { Show(); Activate(); ClampToScreen(); });
+            tray.Text = character.Name + " · 单击人物查看 Codex 额度";
+            var menu = new Forms.ContextMenuStrip { BackColor = System.Drawing.ColorTranslator.FromHtml(Theme["surface"].ToString()),
+                ForeColor = System.Drawing.ColorTranslator.FromHtml(Ink.ToString()) };
+            menu.Items.Add("显示" + character.ShortName, null, delegate { Show(); Activate(); ClampToScreen(); });
+            var characters = new Forms.ToolStripMenuItem("切换角色");
+            foreach (var profile in CharacterCatalog.All)
+            {
+                var selected = profile;
+                var option = new Forms.ToolStripMenuItem(profile.Label) { Checked = profile.Id == character.Id };
+                option.Click += delegate { SwitchCharacter(selected.Id); }; characters.DropDownItems.Add(option);
+            }
+            menu.Items.Add(characters);
             menu.Items.Add("查看用量", null, delegate { OpenPanel(); });
             var pause = new Forms.ToolStripMenuItem("暂停随机台词") { CheckOnClick = true, Checked = state.Paused };
             pause.Click += delegate { SetPaused(pause.Checked); }; menu.Items.Add(pause);
             menu.Opening += delegate { pause.Checked = state.Paused; };
             menu.Items.Add("退出", null, delegate { Close(); });
-            tray.ContextMenuStrip = menu; tray.DoubleClick += delegate { OpenPanel(); }; tray.Visible = true;
+            var previous = tray.ContextMenuStrip; tray.ContextMenuStrip = menu;
+            if (previous != null) previous.Dispose();
+            if (!trayReady) { tray.DoubleClick += delegate { OpenPanel(); }; trayReady = true; }
+            tray.Visible = true;
         }
         void SetPaused(bool paused)
         {
@@ -481,7 +607,7 @@ namespace MadokaDesktop
             Left = Math.Max(area.Left, Math.Min(area.Right - Width, Left));
             Top = Math.Max(area.Top, Math.Min(area.Bottom - Height, Top));
         }
-        void SaveState() { state.Left = Left; state.Top = Top; state.Save(); }
+        void SaveState() { if (preview) return; state.Left = Left; state.Top = Top; state.Save(); }
         void TogglePanel() { if (panel != null && panel.IsVisible) panel.Hide(); else OpenPanel(); }
         void OpenPanel()
         {
@@ -493,18 +619,33 @@ namespace MadokaDesktop
         }
         Button MakeButton(string label, bool primary = false)
         {
-            return new Button { Content = label, Padding = new Thickness(12, 7, 12, 7), Cursor = Cursors.Hand,
-                FontSize = 12, Foreground = primary ? Brushes.White : Wine, Background = primary ? Wine : Brush("#F7EAF0"),
+            var template = (ControlTemplate)XamlReader.Parse(
+                "<ControlTemplate xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' TargetType='Button'>" +
+                "<Border x:Name='frame' xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' CornerRadius='8' Background='{TemplateBinding Background}' Padding='{TemplateBinding Padding}'>" +
+                "<ContentPresenter HorizontalAlignment='Center' VerticalAlignment='Center'/></Border>" +
+                "<ControlTemplate.Triggers><Trigger Property='IsMouseOver' Value='True'><Setter TargetName='frame' Property='Opacity' Value='0.84'/></Trigger>" +
+                "<Trigger Property='IsEnabled' Value='False'><Setter TargetName='frame' Property='Opacity' Value='0.45'/></Trigger>" +
+                "<Trigger Property='IsKeyboardFocused' Value='True'><Setter TargetName='frame' Property='BorderThickness' Value='1'/><Setter TargetName='frame' Property='BorderBrush' Value='{DynamicResource {x:Static SystemColors.ControlTextBrushKey}}'/></Trigger>" +
+                "</ControlTemplate.Triggers></ControlTemplate>");
+            return new Button { Content = label, Padding = new Thickness(12, 7, 12, 7), Cursor = Cursors.Hand, Template = template,
+                FontSize = 12, Foreground = primary ? Brushes.White : Accent, Background = primary ? Accent : Theme["accentSoft"],
                 BorderThickness = new Thickness(0), Margin = new Thickness(0, 0, 8, 0) };
         }
         void CreatePanel()
         {
-            panel = new Window { Title = "円香 · Codex 用量", Width = 354, SizeToContent = SizeToContent.Height,
+            panel = new Window { Title = character.ShortName + " · Codex 用量", Width = 354, SizeToContent = SizeToContent.Height,
                 MaxHeight = Math.Max(320, CurrentWorkArea().Height - 24), WindowStyle = WindowStyle.None,
                 AllowsTransparency = true, Background = Brushes.Transparent, ResizeMode = ResizeMode.NoResize,
                 ShowInTaskbar = false, Topmost = Topmost, FontFamily = FontFamily };
             if (!preview) panel.Owner = this;
-            var shell = new Border { Background = Brush("#FFFAF7"), BorderBrush = Brush("#DAC2C8"), BorderThickness = new Thickness(1),
+            panel.KeyDown += delegate(object sender, KeyEventArgs e) { if (e.Key == Key.Escape) panel.Hide(); };
+            panel.SizeChanged += delegate { if (panel.IsVisible) PositionPanel(); };
+            BuildPanelContent();
+        }
+        void BuildPanelContent()
+        {
+            panel.Title = character.ShortName + " · Codex 用量";
+            var shell = new Border { Background = Theme["surface"], BorderBrush = Theme["border"], BorderThickness = new Thickness(1),
                 CornerRadius = new CornerRadius(20), Padding = new Thickness(21, 18, 21, 18) };
             panel.Content = shell;
             var scroll = new ScrollViewer { VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
@@ -515,11 +656,24 @@ namespace MadokaDesktop
             var close = MakeButton("×"); close.FontSize = 18; close.Padding = new Thickness(8, 0, 8, 0); close.Margin = new Thickness(0);
             close.VerticalAlignment = VerticalAlignment.Top; DockPanel.SetDock(close, Dock.Right); close.Click += delegate { panel.Hide(); }; header.Children.Add(close);
             var heading = new StackPanel();
-            var eyebrow = Text("CODEX  /  WORK", 10, Wine); eyebrow.FontWeight = FontWeights.SemiBold; heading.Children.Add(eyebrow);
-            var title = Text("樋口円香", 23, Ink); title.FontWeight = FontWeights.SemiBold; title.Margin = new Thickness(0, 3, 0, 0); heading.Children.Add(title);
+            var eyebrow = Text("CODEX  /  WORK", 10, Accent); eyebrow.FontWeight = FontWeights.SemiBold; heading.Children.Add(eyebrow);
+            var title = Text(character.Name, 23, Ink); title.FontWeight = FontWeights.SemiBold; title.Margin = new Thickness(0, 3, 0, 0); heading.Children.Add(title);
+            heading.Children.Add(Text(character.Costume, 10.5, Muted));
             header.Children.Add(heading); stack.Children.Add(header);
-            var speech = new Border { Background = Brush("#F5E8EB"), CornerRadius = new CornerRadius(10), Padding = new Thickness(12, 10, 12, 10), Margin = new Thickness(0, 14, 0, 14) };
-            panelLine = Text("额度在这里。看完就去做事吧。", 12, Ink); speech.Child = panelLine; stack.Children.Add(speech);
+            var pickerRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 13, 0, 0) };
+            var pickerLabel = Text("角色", 11, Muted); pickerLabel.VerticalAlignment = VerticalAlignment.Center; pickerLabel.Margin = new Thickness(0, 0, 10, 0);
+            pickerRow.Children.Add(pickerLabel); characterButtons.Clear();
+            foreach (var profile in CharacterCatalog.All)
+            {
+                var selected = profile;
+                var option = MakeButton(profile.ShortName, profile.Id == character.Id); option.MinWidth = 73; option.ToolTip = profile.Label;
+                System.Windows.Automation.AutomationProperties.SetName(option, "切换为" + profile.Name);
+                option.Click += delegate { SwitchCharacter(selected.Id); };
+                characterButtons.Add(profile.Id, option); pickerRow.Children.Add(option);
+            }
+            stack.Children.Add(pickerRow);
+            var speech = new Border { Background = Theme["speech"], CornerRadius = new CornerRadius(10), Padding = new Thickness(12, 10, 12, 10), Margin = new Thickness(0, 12, 0, 14) };
+            panelLine = Text(dialogues.Next("click"), 12, Ink); speech.Child = panelLine; stack.Children.Add(speech);
             panelCards = new StackPanel(); stack.Children.Add(panelCards);
             panelStatus = Text("正在读取额度…", 10.5, Muted); panelStatus.Margin = new Thickness(0, 5, 0, 12); stack.Children.Add(panelStatus);
             var buttons = new StackPanel { Orientation = Orientation.Horizontal };
@@ -527,8 +681,6 @@ namespace MadokaDesktop
             var say = MakeButton("说点什么"); say.Click += delegate { panelLine.Text = dialogues.Next(AmbientCategory()); }; buttons.Children.Add(say);
             stack.Children.Add(buttons);
             var note = Text("台词为同人原创 · 本地随机播放", 10, Muted); note.Margin = new Thickness(0, 13, 0, 0); stack.Children.Add(note);
-            panel.KeyDown += delegate(object sender, KeyEventArgs e) { if (e.Key == Key.Escape) panel.Hide(); };
-            panel.SizeChanged += delegate { if (panel.IsVisible) PositionPanel(); };
         }
         void PositionPanel()
         {
@@ -547,7 +699,7 @@ namespace MadokaDesktop
             refreshButton.IsEnabled = !fetching; refreshButton.Content = fetching ? "读取中…" : "刷新额度";
             if (snapshot == null)
             {
-                var missing = new Border { Background = Brush("#F5EEEA"), CornerRadius = new CornerRadius(12), Padding = new Thickness(14), Margin = new Thickness(0, 0, 0, 8) };
+                var missing = new Border { Background = Theme["card"], CornerRadius = new CornerRadius(12), Padding = new Thickness(14), Margin = new Thickness(0, 0, 0, 8) };
                 var text = new StackPanel(); missing.Child = text;
                 text.Children.Add(Text(fetching ? "正在查看你的额度" : "暂时无法获取额度", 15, Ink));
                 var hint = Text(fetching ? "稍等一下。" : (fetchError ?? "点刷新额度重试。"), 12, Muted); hint.Margin = new Thickness(0, 8, 0, 0); text.Children.Add(hint);
@@ -557,20 +709,20 @@ namespace MadokaDesktop
             bool outdated = fetchError != null || snapshot.Stale;
             if (outdated)
             {
-                var warning = Text(fetchError != null ? "本次刷新失败 · 以下是上次成功读取的数据" : "上次数据已过期 · 请刷新确认", 11, Wine);
+                var warning = Text(fetchError != null ? "本次刷新失败 · 以下是上次成功读取的数据" : "上次数据已过期 · 请刷新确认", 11, Accent);
                 warning.Margin = new Thickness(0, 0, 0, 10); panelCards.Children.Add(warning);
             }
             foreach (var quota in snapshot.Windows)
             {
-                var card = new Border { Background = Brush("#F5EEEA"), CornerRadius = new CornerRadius(12), Padding = new Thickness(14, 12, 14, 12), Margin = new Thickness(0, 0, 0, 9) };
+                var card = new Border { Background = Theme["card"], CornerRadius = new CornerRadius(12), Padding = new Thickness(14, 12, 14, 12), Margin = new Thickness(0, 0, 0, 9) };
                 var content = new StackPanel(); card.Child = content;
                 content.Children.Add(Text(quota.Name, 12, Muted));
                 var line = new DockPanel { Margin = new Thickness(0, 4, 0, 6) };
                 var used = Text("已用 " + quota.Used.ToString("0.#") + "%", 12, Muted); used.VerticalAlignment = VerticalAlignment.Center; DockPanel.SetDock(used, Dock.Right); line.Children.Add(used);
-                var remaining = Text("剩余 " + quota.Remaining.ToString("0.#") + "%", 23, quota.Remaining <= 15 ? Wine : Ink); remaining.FontWeight = FontWeights.SemiBold;
+                var remaining = Text("剩余 " + quota.Remaining.ToString("0.#") + "%", 23, quota.Remaining <= 15 ? Accent : Ink); remaining.FontWeight = FontWeights.SemiBold;
                 line.Children.Add(remaining); content.Children.Add(line);
-                var bar = new ProgressBar { Minimum = 0, Maximum = 100, Value = Math.Min(100, quota.Used), Height = 5, Foreground = Wine,
-                    Background = Brush("#E6D7DA"), BorderThickness = new Thickness(0), ToolTip = "进度条表示已用比例" };
+                var bar = new ProgressBar { Minimum = 0, Maximum = 100, Value = Math.Min(100, quota.Used), Height = 5, Foreground = Accent,
+                    Background = Theme["track"], BorderThickness = new Thickness(0), ToolTip = "进度条表示已用比例" };
                 content.Children.Add(bar);
                 var reset = Text(quota.ResetLabel, 10.5, Muted); reset.Margin = new Thickness(0, 7, 0, 0); content.Children.Add(reset);
                 panelCards.Children.Add(card);
@@ -603,29 +755,60 @@ namespace MadokaDesktop
         public void RenderPreview(string directory)
         {
             Directory.CreateDirectory(directory);
-            SetScale(1); bubbleText.Text = "……一直盯着这边，工作就会自己做完吗。"; bubble.Visibility = Visibility.Visible;
+            SetScale(1);
             var stage = (Grid)Content; Content = null;
-            stage.Background = Brush("#EEE8ED");
-            stage.Measure(new Size(290, 370)); stage.Arrange(new Rect(0, 0, 290, 370)); stage.UpdateLayout();
-            SaveVisual(stage, 290, 370, Path.Combine(directory, "pet-preview.png"));
-            CreatePanel();
-            snapshot = UsageSnapshot.Parse(Json.Read("{\"rateLimits\":{\"primary\":{\"usedPercent\":32,\"windowDurationMins\":300,\"resetsAt\":null},\"secondary\":{\"usedPercent\":58,\"windowDurationMins\":10080,\"resetsAt\":null}}}"));
-            panelLine.Text = "预览示例 · 数字为演示数据"; RenderUsage();
-            panelStatus.Text = "布局预览 · 演示数据，非账号真实用量\n实际运行时从本机 Codex 读取。";
-            var root = (FrameworkElement)panel.Content; panel.Content = null;
-            root.Measure(new Size(354, 800)); var height = Math.Ceiling(root.DesiredSize.Height);
-            root.Arrange(new Rect(0, 0, 354, height)); root.UpdateLayout();
-            SaveVisual(root, 354, (int)height, Path.Combine(directory, "usage-preview.png"));
+            foreach (var profile in CharacterCatalog.All)
+            {
+                SwitchCharacter(profile.Id);
+                bubbleText.Text = dialogues.Next("startup"); bubble.Visibility = Visibility.Visible; bubble.Opacity = 1;
+                stage.Background = Theme["preview"];
+                stage.Measure(new Size(290, 370)); stage.Arrange(new Rect(0, 0, 290, 370)); stage.UpdateLayout();
+                var petPath = Path.Combine(directory, "pet-" + profile.Id + "-preview.png");
+                SaveVisual(stage, 290, 370, petPath);
+                if (panel == null) CreatePanel(); else BuildPanelContent();
+                snapshot = UsageSnapshot.Parse(Json.Read("{\"rateLimits\":{\"primary\":{\"usedPercent\":32,\"windowDurationMins\":300,\"resetsAt\":null},\"secondary\":{\"usedPercent\":58,\"windowDurationMins\":10080,\"resetsAt\":null}}}"));
+                panelLine.Text = "预览示例 · 数字为演示数据"; RenderUsage();
+                panelStatus.Text = "布局预览 · 演示数据，非账号真实用量\n实际运行时从本机 Codex 读取。";
+                var root = (FrameworkElement)panel.Content; panel.Content = null;
+                root.Measure(new Size(354, 800)); var height = Math.Ceiling(root.DesiredSize.Height);
+                root.Arrange(new Rect(0, 0, 354, height)); root.UpdateLayout();
+                var panelPath = Path.Combine(directory, "usage-" + profile.Id + "-preview.png");
+                SaveVisual(root, 354, (int)height, panelPath);
+                if (profile.Id == "madoka")
+                {
+                    File.Copy(petPath, Path.Combine(directory, "pet-preview.png"), true);
+                    File.Copy(panelPath, Path.Combine(directory, "usage-preview.png"), true);
+                }
+            }
         }
         async void RunSmoke(string directory)
         {
             try
             {
                 Directory.CreateDirectory(directory);
+                OpenPanel();
+                var originalPanel = panel;
+                // Exercise the real selector while the async fetch is still in flight.
+                characterButtons["rinze"].RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+                bool switchedWhileFetching = character.Id == "rinze" && figure.Source == character.Image &&
+                    panel.Title.Contains("凛世") && bubble.Background.ToString() == Theme["bubble"].ToString();
                 var deadline = DateTime.UtcNow.AddSeconds(30);
                 while (fetching && DateTime.UtcNow < deadline) await Task.Delay(200);
-                OpenPanel();
                 await Task.Delay(500);
+                var usageBefore = snapshot;
+                var positionBefore = new Point(Left, Top);
+                var characterMenu = (MenuItem)ContextMenu.Items[0];
+                var madokaOption = characterMenu.Items.Cast<MenuItem>().First(m => m.Header.ToString().StartsWith("樋口円香"));
+                madokaOption.RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent));
+                bool switchedBack = character.Id == "madoka" && ReferenceEquals(panel, originalPanel) &&
+                    figure.Source == CharacterCatalog.Get("madoka").Image && bubbleText.Text.Length == 0;
+                var trayCharacters = (Forms.ToolStripMenuItem)tray.ContextMenuStrip.Items[1];
+                var rinzeOption = trayCharacters.DropDownItems.Cast<Forms.ToolStripMenuItem>().First(m => m.Text.StartsWith("杜野凛世"));
+                rinzeOption.PerformClick();
+                bool traySwitchWorks = character.Id == "rinze" && tray.Text.StartsWith("杜野凛世");
+                bool preservedUsage = ReferenceEquals(usageBefore, snapshot);
+                bool preservedPosition = Math.Abs(Left - positionBefore.X) < .1 && Math.Abs(Top - positionBefore.Y) < .1;
+                bool persisted = PetState.Load(Path.Combine(directory, "smoke-state.json")).CharacterId == "rinze";
                 var pauseBefore = state.Paused;
                 SetPaused(true);
                 bool pausedCorrectly = bubble.Visibility == Visibility.Hidden;
@@ -637,9 +820,12 @@ namespace MadokaDesktop
                 bool ownershipCorrect = ReferenceEquals(panel.Owner, this) && IsVisible && panel.IsVisible;
                 panel.UpdateLayout();
                 SaveVisual((Visual)panel.Content, (int)Math.Ceiling(panel.Width), (int)Math.Ceiling(panel.ActualHeight), Path.Combine(directory, "usage-live.png"));
-                var report = new { ok = ownershipCorrect && pausedCorrectly && scaledCorrectly && snapshot != null && fetchError == null,
+                var report = new { ok = ownershipCorrect && pausedCorrectly && scaledCorrectly && snapshot != null && fetchError == null &&
+                        switchedWhileFetching && switchedBack && traySwitchWorks && preservedUsage && preservedPosition && persisted,
                     petVisible = IsVisible, panelVisible = panel.IsVisible, panelOwnership = ownershipCorrect,
                     pauseWorks = pausedCorrectly, scaleWorks = scaledCorrectly, quotaLoaded = snapshot != null,
+                    characterPickerWorks = switchedWhileFetching, rightClickSwitchWorks = switchedBack, traySwitchWorks = traySwitchWorks,
+                    usagePreserved = preservedUsage, positionPreserved = preservedPosition, selectionSaved = persisted,
                     error = fetchError, timestamp = DateTime.Now.ToString("o") };
                 File.WriteAllText(Path.Combine(directory, "ui-smoke.json"), Json.Codec.Serialize(report), Encoding.UTF8);
             }
@@ -686,7 +872,7 @@ namespace MadokaDesktop
                     new PetWindow(true).RenderPreview(args.Length > 1 ? args[1] : "qa"); return 0;
                 }
                 bool created;
-                using (var mutex = new Mutex(true, "Local\\MadokaDesktopPet_1", out created))
+                using (var mutex = new Mutex(true, args.Length > 0 && args[0] == "--smoke" ? "Local\\MadokaDesktopPet_Smoke" : "Local\\MadokaDesktopPet_1", out created))
                 {
                     if (!created) return 0;
                     application.Run(new PetWindow(false, args.Length > 1 && args[0] == "--smoke" ? args[1] : null));
@@ -696,7 +882,7 @@ namespace MadokaDesktop
             catch (Exception ex)
             {
                 try { File.WriteAllText(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "startup-error.log"), ex.ToString(), Encoding.UTF8); } catch { }
-                if (args.Length == 0) MessageBox.Show("円香暂时没能启动。请查看程序旁的 startup-error.log。", "円香桌宠");
+                if (args.Length == 0) MessageBox.Show("桌宠暂时没能启动。请查看程序旁的 startup-error.log。", "桌宠");
                 return 1;
             }
         }
@@ -724,24 +910,44 @@ namespace MadokaDesktop
             single.FetchedAt = DateTime.Now.AddMinutes(-4); Require(single.Stale, "old data stale");
             var reset = UsageSnapshot.Parse(Json.Read("{\"rateLimits\":{\"primary\":{\"usedPercent\":40,\"resetsAt\":1000}}}"));
             Require(reset.Stale && reset.Windows[0].Used == 40, "expired reset doesn't silently invent fresh quota");
-            var dialogues = new DialogueBook(); Require(dialogues.Count >= 40, "original dialogue pool");
-            foreach (var category in new[] { "idle", "click", "low", "empty", "night", "error", "drag", "refresh", "startup" })
+            Require(CharacterCatalog.All.Length == 2 && CharacterCatalog.All.Select(p => p.Id).Distinct().Count() == 2, "unique character identities");
+            Require(CharacterCatalog.Get("unknown").Id == "madoka", "unknown character fallback");
+            Require(CharacterCatalog.Get("rinze").Name == "杜野凛世", "Rinze identity");
+            Require(CharacterCatalog.Get("madoka").Theme["accent"].ToString() != CharacterCatalog.Get("rinze").Theme["accent"].ToString(), "different character palettes");
+            var legacy = PetState.Parse(Json.Read("{\"left\":940,\"top\":401.6,\"scale\":1.2,\"paused\":true,\"topmost\":false}"));
+            Require(legacy.CharacterId == "madoka" && legacy.Left == 940 && legacy.Scale == 1.2 && legacy.Paused && !legacy.Topmost, "legacy preferences preserved");
+            var unknown = PetState.Parse(Json.Read("{\"characterId\":\"removed-character\",\"left\":20}"));
+            Require(unknown.CharacterId == "madoka" && unknown.Left == 20, "unknown saved selection keeps other settings");
+            var stateTestPath = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(output)), "state-character-test.json");
+            Directory.CreateDirectory(Path.GetDirectoryName(stateTestPath));
+            var saved = PetState.Parse(Json.Read("{\"characterId\":\"rinze\",\"left\":100,\"top\":200,\"scale\":1.2,\"paused\":true,\"topmost\":false}"), stateTestPath);
+            saved.Save(); var restored = PetState.Load(stateTestPath);
+            Require(restored.CharacterId == "rinze" && restored.Left == 100 && restored.Top == 200 && restored.Scale == 1.2 && restored.Paused && !restored.Topmost, "selected character survives save/restart");
+            foreach (var profile in CharacterCatalog.All)
             {
-                string previous = "";
-                for (int i = 0; i < 20; i++) { var line = dialogues.Next(category); Require(line.Length > 0 && line != previous, "no adjacent repeat: " + category); previous = line; }
-            }
-            using (var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("madoka.png"))
-            {
-                var image = BitmapFrame.Create(stream, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
-                Require(image.PixelWidth > 100 && image.PixelHeight > 100, "embedded character asset");
+                var dialogues = new DialogueBook(profile.DialogueResource); Require(dialogues.Count >= 40, "original dialogue pool: " + profile.Id);
+                foreach (var category in new[] { "idle", "click", "low", "empty", "night", "error", "drag", "refresh", "startup" })
+                {
+                    string previous = "";
+                    for (int i = 0; i < 20; i++)
+                    {
+                        var line = dialogues.Next(category);
+                        Require(line.Length > 0 && line != previous && line.Length < 85, "readable, nonrepeating dialogue: " + profile.Id + "/" + category);
+                        Require(!line.Contains(profile.Id == "madoka" ? "凛世" : "円香"), "dialogue stays with its character");
+                        previous = line;
+                    }
+                }
+                var image = profile.Image;
+                Require(image.PixelWidth > 100 && image.PixelHeight > 100, "embedded character asset: " + profile.Id);
+                Require(ReferenceEquals(image, profile.Image), "portrait cached between switches");
                 var converted = new FormatConvertedBitmap(image, PixelFormats.Bgra32, null, 0);
                 var pixels = new byte[converted.PixelWidth * converted.PixelHeight * 4]; converted.CopyPixels(pixels, converted.PixelWidth * 4, 0);
                 int transparent = 0, opaque = 0;
                 for (int i = 3; i < pixels.Length; i += 4) { if (pixels[i] == 0) transparent++; if (pixels[i] > 200) opaque++; }
-                Require(transparent > image.PixelWidth * image.PixelHeight / 5 && opaque > 10000, "real transparent background and visible figure");
+                Require(transparent > image.PixelWidth * image.PixelHeight / 5 && opaque > 10000, "real transparent background and visible figure: " + profile.Id);
             }
             var parent = Path.GetDirectoryName(Path.GetFullPath(output)); Directory.CreateDirectory(parent);
-            File.WriteAllText(output, "PASS: " + checks + " assertions\nQuota parsing, freshness, original dialogues, embedded transparent character.\n", Encoding.UTF8);
+            File.WriteAllText(output, "PASS: " + checks + " assertions\nQuota parsing, freshness, character palettes/resources, both dialogue pools, transparent portraits, legacy state and selection persistence.\n", Encoding.UTF8);
         }
     }
 }
