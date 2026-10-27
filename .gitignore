@@ -1,0 +1,5 @@
+state.json
+*.log
+/qa/
+*.exe
+*.zip
